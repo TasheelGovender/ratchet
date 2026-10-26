@@ -1,0 +1,3 @@
+# Repo profiles describe private repos; they stay on this machine.
+repos/*
+.DS_Store
