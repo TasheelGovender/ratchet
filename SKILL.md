@@ -17,7 +17,7 @@ Packs live at `~/.claude/plans/<repo>-<slug>/`. ratchet never uses helix and wri
 | `/ratchet run <slug> [n]` | build PR n onward, one background agent per PR, until the owner is needed |
 | `/ratchet restack <slug> <n> [change]` | change open PR n, rebase the open PRs above it |
 | `/ratchet ready <slug> <n>` | merge and deploy verdict for a built PR |
-| `/ratchet landed <slug> <n>` | PR n merged: clean up, move the rest of the stack onto main |
+| `/ratchet landed <slug> [n]` | PR n (or every merged PR) landed: clean up, move the rest of the stack onto main |
 
 `<slug>` names one piece of work, and so one pack: the pack directory minus `<repo>-` (`billing-export` → `~/.claude/plans/<repo>-billing-export/`). **make** sets it, kebab-case, from the work's name; every other command takes the same slug, or the full directory name. It is distinct from the pack's short abbreviation (`bex`), which only names branches, worktrees and compose projects (profile §Naming). Plain-language asks map onto these: "split this into checkpoints, I'll use goal" is **make**; "give me the goal cmd for PR 2" is **goal**; "build the rest" or "keep going until the deploy" is **run**; "PR 1 needs a change, carry it up" is **restack**; "is this PR safe to merge" is **ready**; "PR 3 is merged, clean up" is **landed**.
 
@@ -25,13 +25,14 @@ Packs live at `~/.claude/plans/<repo>-<slug>/`. ratchet never uses helix and wri
 
 1. **Repo profile.** `<repo>` is the basename of the main checkout's git toplevel. Read `repos/<repo>.md` beside this file in full: gates, CI jobs, workspace, conventions and deploy rules all come from it. No profile → write one first (§New repo profile).
 2. **Pack.** If `<pack>/README.md` exists, read it and the chapter in play. The pack README is what goal sessions obey; keep it the single source of truth for the protocol, and change the pack (not the templates) when one pack needs something different.
-3. **Log.** `<pack>/LOG.md` is append-only, one line per event:
+3. **Log.** `<pack>/LOG.md` is append-only, one line per event. Read it before saying anything about the pack's state. ratchet's own commands write it; build sessions (a `/goal` session, a run's build agent) never do.
    - `PR <n> built #<pr> tip <sha> CI green <run url> <date>`
    - `PR <n> tip <sha> <date> (<why>)`, written before and after any branch move
    - `PR <n> merged <sha> <date>; cleaned`
    - `RUN start <date> from PR <n>` and `RUN end <date> <outcome>`
-
-   A `RUN start` with no later `RUN end` means a run is building. While it is, `landed` and `restack` move no branch of this pack: say which PR is building and wait for the run's block, unless the owner says the run is dead.
+   - `LOCK <command> <date>` and `UNLOCK <command> <date>`
+4. **Lock.** One session at a time moves this pack's branches. `run` holds the lock from `RUN start` to `RUN end`. `restack` and `landed` append `LOCK` before their first branch move and `UNLOCK` when they stop, whatever the outcome; called from inside a run, they use the run's lock and write neither. A `RUN start` with no later `RUN end`, or a `LOCK` with no later `UNLOCK`, means another session holds the lock: name it (for a run, the PR building), say that a run lands merged PRs itself (§run step 2.1), and stop. Only the owner clears a dead holder; on their word, append `RUN end <date> abandoned (owner)` or `UNLOCK <command> <date> (owner: stale)`.
+5. **PR numbers.** `<n>` is always the pack's PR number. Its GitHub number comes from the LOG's `built #<pr>` line, else `gh pr list --head <branch> --state all --json number,state`. Every `gh pr` call takes the GitHub number.
 
 ## make
 
@@ -47,18 +48,27 @@ Input is a **settled** plan: a file the user names, or the decisions settled in 
    - `setup-worktree.sh` from the profile's script template, on the next free port block (profile §Workspace), `chmod +x`;
    - `REVIEW_PROMPT` from `templates/REVIEW_PROMPT.md`; an empty `approvals/` directory.
 6. **Check.** `node ~/.claude/skills/ratchet/scripts/check-pack.mjs <pack>`; fix and re-run until it prints `OK`.
-7. **Show** a table (PR · title · checkpoints in a few words · can start when), the pause points, and every place the pack departs from what was discussed, with the reason. Offer `/ratchet review`.
+7. **Show** a table (PR · title · checkpoints in a few words · can start when) and the pause points. Then a plain-language rundown the owner can sign off from without opening a chapter: what changes for operators and callers, PR by PR; the owner's decisions the pack rests on (§1); and every decision the pack makes that the owner did not, each with what an operator or caller will see and the alternative. Then every place the pack departs from what was discussed, with the reason. Offer `/ratchet review`.
 
 Done when `check-pack` prints `OK` and the table is shown.
 
 ## review
 
-The adversarial plan review, run with the mechanics in `~/.claude/skills/codex-review/SKILL.md` Step 2 (read it for the exact commands): read-only (`-s read-only` on the first call, `-c sandbox_mode="read-only"` on every resume), `< /dev/null`, Bash timeout 600000, no `-m`, one thread for every round.
+The adversarial plan review, one Codex thread for every round. Codex runs only through `scripts/codex-review.mjs`, which keeps it read-only, caps each round's wall clock (30 min) and silence (10 min), and retries a failed round twice. Never call `codex exec` directly, never pass `-m`. Run from the main checkout:
 
-1. Round 1 sends `<pack>/REVIEW_PROMPT`; later rounds resume the same thread with "I revised the pack. Re-review the same files. Same rules. End with VERDICT: APPROVED or VERDICT: REVISE." Up to 5 rounds.
-2. After each REVISE: decide each finding (fix, or reject with a reason), edit the pack, re-run `check-pack`, append the critique and your dispositions to `<pack>/PLAN-REVIEW-LOG.md`.
-3. On APPROVED, or deadlock at round 5: show three bullets on what the review changed, and every unresolved point with both positions.
-4. **Sign-off.** Ask the owner to sign off the pack. On their yes, write `<pack>/approvals/plan` holding the date, the base sha and the round count. Every goal refuses to start without this file. A pack edit after sign-off (a `c2b` added at a pause, a fact that drifted) is shown to the owner as a diff before the next goal runs.
+```
+R=~/.claude/skills/ratchet/scripts/codex-review.mjs
+node $R start <pack>/plan-review/r1.md --prompt-file <pack>/REVIEW_PROMPT                      # round 1
+node $R start <pack>/plan-review/r<k>.md --resume <thread> --message "<text>"                  # round k
+node $R wait <pack>/plan-review/r<k>.md                                                        # Bash timeout 600000
+```
+
+`wait` exits 2 while Codex is still working: run it again. Exit 0 prints the thread id and the VERDICT line; Codex's critique is in `r<k>.md`. Exit 1 means three attempts failed: stop and report it with the log paths it prints.
+
+1. Round 1 sends `<pack>/REVIEW_PROMPT`; write its thread id at the top of `<pack>/PLAN-REVIEW-LOG.md`. Later rounds resume that thread with "I revised the pack. Re-review the same files. Same rules. End with VERDICT: APPROVED or VERDICT: REVISE." Up to 5 rounds.
+2. After each REVISE, decide each finding: fix it, reject it with a reason, or ask the owner. **A finding goes to the owner, unapplied,** when its fix would add or change something an operator or caller sees (a refusal, an error code, a rule, a default, a figure on screen) or narrow a §1 decision: put it to them with each option and what an operator or caller would see under it, and apply what they choose. Edit the pack, re-run `check-pack`, and append the critique and your dispositions (`fixed` / `rejected because …` / `owner: <choice>`) to `<pack>/PLAN-REVIEW-LOG.md`.
+3. On APPROVED, or deadlock at round 5: show three bullets on what the review changed, the findings the owner decided and what they chose, and every unresolved point with both positions.
+4. **Sign-off.** Show make step 7's rundown again, updated for what the review changed, and ask the owner to sign off the pack. On their yes, write `<pack>/approvals/plan` holding the date, the base sha and the round count. Every goal refuses to start without this file. A pack edit after sign-off (a `c2b` added at a pause, a fact that drifted) is shown to the owner as a diff before the next goal runs.
 
 ## goal
 
@@ -72,25 +82,29 @@ The adversarial plan review, run with the mechanics in `~/.claude/skills/codex-r
 
 ## run
 
-Builds PR n, n+1, … in order, each by one background build agent with a fresh context, and stops at the first point that needs the owner. This session only coordinates: it never edits code, and it reads each agent's final block, not its work, so its own context stays small across many PRs. Without n, it starts at the first PR in §2 order that is neither merged (`gh pr view`) nor already built (step 2.1), however its earlier PRs were built. Start it from the main checkout in auto mode; to hold it to the end, the owner can wrap it: `/goal Run the ratchet run for <slug> from PR <n> (~/.claude/skills/ratchet/SKILL.md §run). Met only when a RUN REPORT, RUN PAUSED or RUN BLOCKED block is printed.`
+Builds PR n, n+1, … in order, each by one background build agent with a fresh context, and stops at the first point that needs the owner. This session only coordinates: it never edits code, and it reads each agent's final block, not its work, so its own context stays small across many PRs. The owner may merge built PRs while it runs; the run lands them itself between builds (step 2.1), so no other session cleans up meanwhile. Without n, it starts at the first PR in §2 order that is neither merged (`gh pr view`) nor already built (step 2.2), however its earlier PRs were built. Start it from the main checkout in auto mode; to hold it to the end, the owner can wrap it: `/goal Run the ratchet run for <slug> from PR <n> (~/.claude/skills/ratchet/SKILL.md §run). Met only when a RUN REPORT, RUN PAUSED or RUN BLOCKED block is printed.`
 
-1. **Start.** `approvals/plan` exists, else stop and point at `review`. Append `RUN start`.
+1. **Start.** `approvals/plan` exists, else stop and point at `review`. No other session holds the lock (Shared setup step 4), else stop. Append `RUN start`; the run now holds the lock until `RUN end`.
 2. **For each PR k from n**, one at a time (two PRs never build at once: each stacks on the last one's final commit):
-   1. **Already built?** An open PR whose head is the branch tip, with CI green on that head (a PR a `/goal` session built counts) → append the `built` line if the log lacks it, next k. A merged PR → next k. A re-run resumes here.
-   2. **Can it start?** If §2 or the chapter's goal makes PR k wait on PR k-1's deploy, run the profile's deploy check; not confirmed → stop with `RUN PAUSED` naming the deploy. Then **goal** steps 1–2 (preflight, workspace).
-   3. **Dispatch** one Agent (general-purpose, `run_in_background`) whose prompt is the chapter's Goal block with the base resolved, followed by:
+   1. **Land what merged.** No build agent is running at this point. For every pack PR the LOG does not record as merged, `gh pr view <#> --json state,mergeCommit,headRefOid`; a PR is landed-ready when its state is `MERGED` and its merge commit is on `origin/main`. For those, lowest first, **landed** steps 2, 3 and 5; then, once for all of them, **landed** step 4, which moves the open PRs above onto `origin/main`. A conflict or red gate there stops with `RUN BLOCKED` carrying restack's table: the coordinator resolves no conflict itself.
+   2. **Already built?** An open PR whose head is the branch tip, with CI green on that head (a PR a `/goal` session built counts) → append the `built` line if the log lacks it, next k. A merged PR → next k. A re-run resumes here.
+   3. **Can it start?** If §2 or the chapter's goal makes PR k wait on PR k-1's deploy, run the profile's deploy check; not confirmed → stop with `RUN PAUSED` naming the deploy. Then **goal** steps 1–2 (preflight, workspace).
+   4. **Dispatch** one Agent (general-purpose, `run_in_background`) whose prompt is the chapter's Goal block with the base resolved, followed by:
       - "Work in `<worktree>`: begin every Bash command with `cd <worktree> &&`."
       - for a PR that waits on a deploy: "PR k-1 is confirmed deployed: `<deploy run url>`."
+      - "Run every gate, Codex round and CI wait in the foreground: never `run_in_background`, never `sleep`. A job still running when you end lands on the coordinator. Wait longer than one Bash call by repeating a foreground command: `codex-review.mjs wait` until it exits 0 or 1 (README §5); `gh pr checks <pr> --watch` with Bash timeout 600000, run again until it exits. CI still running is not a reason to stop: end only when CI on the head has finished."
+      - "Never write the pack's LOG.md; the coordinator does."
       - "You run unattended and nobody answers questions. Wherever the goal says to stop, print the block and end. Your final message ends with the `PR k REPORT`, `PR k PAUSED` or `PR k BLOCKED` block, verbatim."
-   4. **No block in the final message** → SendMessage the same agent: "Continue the goal from where you stopped (README §4.1 resume). End with the block." If it cannot continue (context spent, agent gone), dispatch a fresh agent with the same prompt; it resumes after the last committed checkpoint. Three tries without a block → stop with `RUN BLOCKED`.
-   5. **`PAUSED` or `BLOCKED`** → stop, carrying the block.
-   6. **Verify a `REPORT`**; trust none of it unchecked: `gh pr view` shows it open, with head = the branch tip and base = PR k's base; `gh pr checks` shows the profile's CI jobs green on that head (profile §CI says which skips are not passes); `git log <base>..<branch>` holds one commit per chapter checkpoint; `<pack>/pr<k>-review/` holds the notes with no open blocker or high. A miss → send the agent what failed, once; still missing → stop with `RUN BLOCKED`.
-   7. **Record and idle.** Append `PR <k> built …`. Stop PR k's stack by the profile's idle command; volumes and worktree stay for the owner's review and for `landed`.
-   8. No PR k+1 → stop: end of pack.
+   5. **No block in the final message** → SendMessage the same agent: "Continue the goal from where you stopped (README §4.1 resume). End with the block." If it cannot continue (context spent, agent gone), dispatch a fresh agent with the same prompt; it resumes after the last committed checkpoint. Three tries without a block → stop with `RUN BLOCKED`.
+   6. **`PAUSED` or `BLOCKED`** → stop, carrying the block. Except a `BLOCKED` whose only reason is CI still running: SendMessage the agent once, "CI is still running on `<sha>`; watch it in the foreground (`gh pr checks <pr> --watch`) and finish the goal," and take its next block as final. The coordinator does not watch CI itself.
+   7. **Verify a `REPORT`**; trust none of it unchecked: `gh pr view` shows it open, with head = the branch tip and base = PR k's base; `gh pr checks` shows the profile's CI jobs green on that head (profile §CI says which skips are not passes); `git log --format='%h %s' <base>..<branch>` holds one commit per chapter checkpoint, in checkpoint order, then exactly the commits the report lists under `fixes:` and no others; `<pack>/pr<k>-review/` holds the notes with no open blocker or high. A miss → send the agent what failed, once; still missing → stop with `RUN BLOCKED`.
+   8. **Record and idle.** Append `PR <k> built …`. Stop PR k's stack by the profile's idle command; volumes and worktree stay for the owner's review and for `landed`.
+   9. No PR k+1 → stop: end of pack.
 3. **Print** one block, then append `RUN end <date> <outcome>`:
    ```
    RUN REPORT | RUN PAUSED | RUN BLOCKED  <slug>
-   PR <k> #<pr> built, tip <sha>, CI green <run url>    (one line per PR built this run)
+   PR <k> #<pr> merged, cleaned; PRs above moved onto main    (one line per PR landed this run)
+   PR <k> #<pr> built, tip <sha>, CI green <run url>          (one line per PR built this run)
    stopped: end of pack | PR <k> waits on PR <k-1>'s deploy | <the PR block, verbatim>
    next: <the owner's step, then the command that continues>
    ```
@@ -102,7 +116,7 @@ Carries a change to open PR n up through the open PRs stacked on it. The change 
 
 1. **Preflight.**
    - PR n is open (merged → that is `landed`);
-   - no run is building (Shared setup step 3);
+   - no other session holds the lock (Shared setup step 4); append `LOCK restack`, and `UNLOCK restack` wherever restack stops;
    - the stack above: every PR k > n whose branch exists, in order;
    - each of their worktrees is clean (`git status --porcelain`; dirty → show it and ask);
    - record every one of those branches' tips, and PR n's, now (`git fetch`, `git rev-parse origin/<branch>`): these are the old tips. Append `PR <k> tip <sha> <date> (before restack)` for each.
@@ -112,7 +126,7 @@ Carries a change to open PR n up through the open PRs stacked on it. The change 
    - PR n's local PR gate (README §4.3), then push (`--force-with-lease` after a rebase).
 
    A change that contradicts the chapter or README §1 stops here and is reported: chapters change only on the owner's word.
-3. **Move each PR above, lowest first.** For k = n+1, …: in its worktree after `setup-worktree.sh`, `git fetch`, then `git rebase --onto origin/<PR k-1 branch> <PR k-1 old tip> <PR k branch>`. Conflicts only in PR k's chapter files → resolve them; any other → `git rebase --abort` and stop. Run PR k's local PR gate; a failure stops before PR k is pushed and names the PR and the test (the change may have made PR k's chapter wrong, which is the owner's call). Then `git push --force-with-lease`.
+3. **Move each PR above, lowest first.** For k = n+1, …: in its worktree after `setup-worktree.sh`, `git fetch`, then `git rebase --onto origin/<PR k-1 branch> <PR k-1 old tip> <PR k branch>`. Conflicts only in PR k's chapter files → resolve them; any other → `git rebase --abort` and stop. If the new tip's tree equals the old tip's (`git diff --quiet <old tip> HEAD`), the code is unchanged: skip the local gate, CI reruns it. Otherwise run PR k's local PR gate, its integration tests on a recreated database (an idled volume carries state from before the rebase); a failure stops before PR k is pushed and names the PR and the test (the change may have made PR k's chapter wrong, which is the owner's call). Then `git push --force-with-lease`.
 4. **CI.** Wait for each pushed head (`gh pr checks <pr> --watch`), rerunning runner collisions per profile §CI. A failure is reported, not fixed: restack resolves conflicts and nothing else.
 5. **Log** `PR <k> tip <sha> <date> (restacked from PR <n>)` for each moved PR. Report a table (PR · old tip → new tip · gate · CI), then what stopped it, if anything.
 
@@ -129,11 +143,13 @@ Open with one line, `Safe to merge and deploy` or `Not yet: <reason>`, then **Me
 
 ## landed
 
-1. `gh pr view <n> --json state,mergeCommit`. Not merged → say so and stop.
+`/ratchet landed <slug> <n>` lands PR n; without n, it lands every pack PR merged into main that the LOG does not record as merged, in one pass. A run does the same between builds (§run step 2.1), under its own lock.
+
+1. **Check.** No other session holds the lock (Shared setup step 4); append `LOCK landed`, and `UNLOCK landed` wherever landed stops. For each PR (GitHub number per Shared setup step 5): `gh pr view <#> --json state,mergeCommit,headRefOid`. Merged means state `MERGED` with the merge commit on `origin/main`; a PR not merged is named and left alone, and with none merged landed stops.
 2. **Keep the record.** Codex notes belong in `<pack>/pr<n>-review/`; copy any that live only in the worktree (`.scratch/`) into the pack before deleting anything.
 3. **Tear down only this PR** by the profile's teardown: its compose project with `down -v`, that project's images, listeners on this PR's ports, the worktree (show `git status --porcelain` and ask first if it holds untracked or modified non-ignored files), the local branch once merged into `origin/main`, `git fetch --prune`. Name every other pack's stack and worktree still running and leave them untouched.
-4. **Move the rest of the stack.** If PR n+1's branch exists: record the old tips (restack step 1's last bullet), then restack steps 3–5 with `origin/main` as PR n+1's new base and `gh pr view <n> --json headRefOid` (PR n's head when it merged) as PR n's old tip. Then `gh pr edit <n+1> --base main` if GitHub has not already retargeted it. If PR n+1 is not started, give `/ratchet run <slug> <n+1>` (or `goal`) and any deploy it waits on.
-5. **Log.** Append `PR <n> merged <sha> <date>; cleaned` to `<pack>/LOG.md`, and update the repo's memory handoff for this work if one exists.
+4. **Move the rest of the stack**, once for all the PRs landed now. Let h be the highest of them and m = h+1, the lowest PR still open. If PR m's branch exists: record the old tips (restack step 1's last bullet), then restack steps 3–5 for PRs m, m+1, … with `origin/main` as PR m's new base and PR h's `headRefOid` (its head when it merged) as the old tip below PR m. Then `gh pr edit <#m> --base main` if GitHub has not already retargeted it. If PR m is not started, give `/ratchet run <slug> <m>` (or `goal`) and any deploy it waits on.
+5. **Log.** Append `PR <n> merged <sha> <date>; cleaned` to `<pack>/LOG.md` for each PR landed, and update the repo's memory handoff for this work if one exists.
 6. Report **Removed**, **Saved**, **Not touched**.
 
 ## New repo profile
